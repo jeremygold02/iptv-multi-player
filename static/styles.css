@@ -861,6 +861,39 @@ body.recording-footer-visible .detail-panel {
   box-shadow: inset 3px 0 0 var(--teal);
 }
 
+.channel-stream-group > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.channel-stream-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.channel-stream-group > summary:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: -2px;
+}
+
+.stream-group-chevron {
+  justify-self: end;
+  display: flex;
+  color: var(--muted);
+}
+
+.channel-stream-group[open] > summary .stream-group-chevron {
+  transform: rotate(180deg);
+}
+
+.channel-stream-group .channel-stream-row {
+  padding-left: 24px;
+  box-shadow: inset 3px 0 0 var(--line-soft);
+}
+
+.channel-stream-group .channel-stream-row.selected {
+  box-shadow: inset 3px 0 0 var(--teal);
+}
+
 .channel-main,
 .detail-main {
   display: flex;

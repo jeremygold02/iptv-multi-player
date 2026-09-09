@@ -93,6 +93,7 @@ let lastChannelClick = {
 };
 const sharedApiRequests = new Map();
 const queuedApiRequests = new Map();
+const expandedChannelGroups = new Set();
 
 function $(id) {
   return document.getElementById(id);
@@ -1351,30 +1352,61 @@ function renderCategories() {
   }).join("");
 }
 
+function channelStreamName(channel) {
+  const name = channel.name.trim();
+  if (!name.endsWith(")")) return { title: name, label: name };
+  let depth = 0;
+  for (let index = name.length - 1; index >= 0; index -= 1) {
+    if (name[index] === ")") depth += 1;
+    if (name[index] !== "(") continue;
+    depth -= 1;
+    if (depth !== 0) continue;
+    const title = name.slice(0, index).trim();
+    const label = name.slice(index + 1, -1).trim();
+    if (title && label) return { title, label };
+    break;
+  }
+  return { title: name, label: name };
+}
+
+function groupedChannels(channels) {
+  const groups = new Map();
+  for (const channel of channels) {
+    const { title, label } = channelStreamName(channel);
+    const key = JSON.stringify([channel.group, title.replace(/\s+/g, " ").toLowerCase()]);
+    if (!groups.has(key)) groups.set(key, { key, title, streams: [] });
+    groups.get(key).streams.push({ channel, label });
+  }
+  return [...groups.values()];
+}
+
 function renderChannels() {
   if (!appState) return;
   const channels = filteredChannels();
   const favorites = new Set(appState.favorites);
   const playerLabel = selectedPlayerLabel();
-  els.resultCount.textContent = `${channels.length} visible`;
+  const groups = groupedChannels(channels);
+  els.resultCount.textContent = groups.length === channels.length
+    ? `${channels.length} visible`
+    : `${groups.length} rows · ${channels.length} streams`;
   if (channels.length === 0) {
     els.channelList.innerHTML = `<div class="empty-state">No matching channels</div>`;
     return;
   }
 
-  els.channelList.innerHTML = channels.map((channel) => {
+  const channelRowHtml = (channel, label = channel.name, nested = false) => {
     const isFavorite = favorites.has(channel.id);
     return `
-      <div class="channel-row ${selectedChannelId === channel.id ? "selected" : ""}" data-channel-id="${channel.id}">
+      <div class="channel-row ${nested ? "channel-stream-row" : ""} ${selectedChannelId === channel.id ? "selected" : ""}" data-channel-id="${channel.id}">
         <div class="channel-main">
           ${logoHtml(channel)}
           <div class="channel-text">
-            <div class="channel-name">${escapeHtml(channel.name)}</div>
+            <div class="channel-name" title="${escapeHtml(channel.name)}">${escapeHtml(label)}</div>
             <div class="channel-subtitle">${escapeHtml(sourceName(channel.source_id))}</div>
           </div>
         </div>
         <div class="group-pill">${escapeHtml(channel.group)}</div>
-        ${gameStatusHtml(channel)}
+        ${nested ? '<div></div>' : gameStatusHtml(channel)}
         <div class="row-actions">
           <button class="icon-button favorite-button ${isFavorite ? "active" : ""}" data-action="favorite" title="${isFavorite ? "Remove favorite" : "Favorite"}" type="button">
             ${iconHtml(isFavorite ? "favorite" : "favorite_border")}
@@ -1385,6 +1417,27 @@ function renderChannels() {
           </button>
         </div>
       </div>
+    `;
+  };
+  els.channelList.innerHTML = groups.map((group) => {
+    if (group.streams.length === 1) return channelRowHtml(group.streams[0].channel);
+    const channel = group.streams[0].channel;
+    return `
+      <details class="channel-stream-group" data-channel-group="${escapeHtml(group.key)}" ${expandedChannelGroups.has(group.key) ? "open" : ""}>
+        <summary class="channel-row">
+          <div class="channel-main">
+            ${logoHtml(channel)}
+            <div class="channel-text">
+              <div class="channel-name" title="${escapeHtml(group.title)}">${escapeHtml(group.title)}</div>
+              <div class="channel-subtitle">${group.streams.length} streams</div>
+            </div>
+          </div>
+          <div class="group-pill">${escapeHtml(channel.group)}</div>
+          ${gameStatusHtml(channel)}
+          <span class="stream-group-chevron">${iconHtml("expand_more")}</span>
+        </summary>
+        ${group.streams.map(({ channel: stream, label }) => channelRowHtml(stream, label, true)).join("")}
+      </details>
     `;
   }).join("");
 }
@@ -3248,6 +3301,13 @@ function bindEvents() {
     categoryDrag = null;
     clearCategoryDraggingState();
   });
+
+  els.channelList.addEventListener("toggle", (event) => {
+    const group = event.target;
+    if (!group.matches("details[data-channel-group]") || !group.isConnected) return;
+    if (group.open) expandedChannelGroups.add(group.dataset.channelGroup);
+    else expandedChannelGroups.delete(group.dataset.channelGroup);
+  }, true);
 
   els.channelList.addEventListener("click", async (event) => {
     const target = eventTargetElement(event);

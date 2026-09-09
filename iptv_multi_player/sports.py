@@ -52,13 +52,28 @@ def team_match_score(left: str, right: str) -> float:
     return SequenceMatcher(None, left_norm, right_norm).ratio()
 
 
+def channel_game_title(name: str) -> str:
+    name = name.strip()
+    if name.endswith(")"):
+        depth = 0
+        for index in range(len(name) - 1, -1, -1):
+            if name[index] == ")":
+                depth += 1
+            elif name[index] == "(":
+                depth -= 1
+                if depth == 0:
+                    title = name[:index].strip()
+                    label = name[index + 1:-1].strip()
+                    return title if title and label else name
+    return name
+
+
 def parse_channel_matchup(channel: dict[str, Any]) -> dict[str, str] | None:
     sport = SPORT_BY_GROUP.get(channel.get("group", ""))
     if not sport:
         return None
 
-    name = str(channel.get("name", "")).strip()
-    title = re.sub(r"\s*\([^()]*\)\s*$", "", name).strip()
+    title = channel_game_title(str(channel.get("name", "")))
     if SPORTS_CONFIG[sport].get("event_kind") == "race":
         return {
             "sport": sport,
@@ -880,6 +895,8 @@ def enrich_channels_with_games(channels: list[dict[str, Any]]) -> tuple[list[dic
     cache, meta = ensure_sports_cache_for(channels)
     query_dates = sports_query_dates()
     enriched = []
+    games_by_matchup: dict[tuple[str, str], dict[str, Any]] = {}
+    events_by_sport: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
 
     for channel in channels:
         next_channel = dict(channel)
@@ -890,8 +907,18 @@ def enrich_channels_with_games(channels: list[dict[str, Any]]) -> tuple[list[dic
             continue
 
         sport = matchup["sport"]
-        espn_events = cached_espn_events(cache, sport)
-        api_sports_events = cached_api_sports_events(cache, sport, query_dates)
+        matchup_key = (sport, " ".join(matchup["title"].casefold().split()))
+        if matchup_key in games_by_matchup:
+            next_channel["game"] = dict(games_by_matchup[matchup_key])
+            enriched.append(next_channel)
+            continue
+
+        if sport not in events_by_sport:
+            events_by_sport[sport] = (
+                cached_espn_events(cache, sport),
+                cached_api_sports_events(cache, sport, query_dates),
+            )
+        espn_events, api_sports_events = events_by_sport[sport]
         event, confidence = best_event_match(matchup, espn_events)
         if event is None:
             event, confidence = best_event_match(matchup, api_sports_events)
@@ -902,6 +929,7 @@ def enrich_channels_with_games(channels: list[dict[str, Any]]) -> tuple[list[dic
             next_channel["game"] = unmatched_game_metadata(channel, reason)
         else:
             next_channel["game"] = game_metadata(event, sport, confidence)
+        games_by_matchup[matchup_key] = next_channel["game"]
         enriched.append(next_channel)
 
     return enriched, meta
