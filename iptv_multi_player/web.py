@@ -39,6 +39,7 @@ app = Flask(
     static_folder=str(ASSET_DIR / "static"),
 )
 state_lock = threading.RLock()
+sports_refresh_lock = threading.Lock()
 
 
 def app_icon_path() -> Path | None:
@@ -140,9 +141,10 @@ def api_state():
 @app.post("/api/sports/refresh")
 def api_sports_refresh():
     try:
-        with state_lock:
-            state = read_state()
-        return jsonify({"success": True, "data": public_state(state=state, enrich_games=True)})
+        with sports_refresh_lock:
+            with state_lock:
+                state = read_state()
+            return jsonify({"success": True, "data": public_state(state=state, enrich_games=True)})
     except Exception as exc:  # noqa: BLE001 - game enrichment should not crash the app shell
         return json_error(f"Could not refresh game data: {exc}", 502)
 

@@ -66,6 +66,9 @@ let uiPrefs = {
 };
 let sidebarResize = null;
 let sportsRefreshTimer = null;
+let sportsRefreshIntervalSeconds = 0;
+let sportsRefreshPromise = null;
+let sportsRefreshShowErrors = false;
 let recordingStatusTimer = null;
 let apiKeyVisible = false;
 let launchUpdateChecked = false;
@@ -327,13 +330,20 @@ async function loadState() {
   scheduleSportsRefresh();
   scheduleRecordingStatusRefresh();
   checkForLaunchUpdate();
-  refreshPlaylistData({ refreshSports: true });
+  refreshSportsData().finally(() => {
+    refreshPlaylistData({ refreshSports: true });
+  });
 }
 
 function scheduleSportsRefresh() {
+  const seconds = appState?.sports?.configured
+    ? Number(appState.sports.refresh_seconds) || 1800
+    : 0;
+  if (sportsRefreshTimer && seconds === sportsRefreshIntervalSeconds) return;
   window.clearInterval(sportsRefreshTimer);
-  if (!appState?.sports?.configured) return;
-  const seconds = Number(appState?.sports?.refresh_seconds) || 1800;
+  sportsRefreshTimer = null;
+  sportsRefreshIntervalSeconds = seconds;
+  if (!seconds) return;
   sportsRefreshTimer = window.setInterval(async () => {
     await refreshSportsData({ showErrors: true });
   }, seconds * 1000);
@@ -362,20 +372,36 @@ function setAppState(nextState, options = {}) {
   applyPinnedCategoryPrefs();
 }
 
-async function refreshSportsData(options = {}) {
-  if (!appState?.sports?.configured) return null;
-  try {
-    const data = await api("/api/sports/refresh", { method: "POST" });
-    setAppState(data);
-    render();
-    scheduleSportsRefresh();
-    return data;
-  } catch (error) {
-    if (options.showErrors) {
-      showToast(error.message, "error");
-    }
-    return null;
+function refreshSportsData(options = {}) {
+  if (sportsRefreshPromise) {
+    sportsRefreshShowErrors ||= Boolean(options.showErrors);
+    return sportsRefreshPromise;
   }
+  if (!appState?.sports?.configured) return Promise.resolve(null);
+
+  sportsRefreshShowErrors = Boolean(options.showErrors);
+  const request = (async () => {
+    try {
+      const data = await api("/api/sports/refresh", { method: "POST" });
+      setAppState(data);
+      render();
+      scheduleSportsRefresh();
+      return data;
+    } catch (error) {
+      if (sportsRefreshShowErrors) {
+        showToast(error.message, "error");
+      }
+      return null;
+    }
+  })();
+  const trackedRequest = request.finally(() => {
+    if (sportsRefreshPromise === trackedRequest) {
+      sportsRefreshPromise = null;
+      sportsRefreshShowErrors = false;
+    }
+  });
+  sportsRefreshPromise = trackedRequest;
+  return trackedRequest;
 }
 
 async function refreshPlaylistData(options = {}) {
@@ -1642,16 +1668,15 @@ function renderRecordingFooter() {
 async function refreshRecordingStatus() {
   try {
     const status = await api("/api/recording/status");
-    if (shouldKeepLocalRecordingStatus(status)) {
+    const previousState = JSON.stringify(recordingState);
+    if (!shouldKeepLocalRecordingStatus(status)) {
+      setRecordingStatus(status);
+    }
+    if (JSON.stringify(recordingState) !== previousState) {
       renderChannels();
       renderDetail();
       renderRecordingFooter();
-      return recordingState;
     }
-    setRecordingStatus(status);
-    renderChannels();
-    renderDetail();
-    renderRecordingFooter();
     return recordingState;
   } catch {
     return recordingState;

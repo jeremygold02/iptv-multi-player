@@ -26,9 +26,9 @@ For most users, choose `IPTV Multi Player Setup.exe`. If you prefer a portable a
 
 ## Sports Data
 
-ESPN scoreboard data is used first and does not require an API key. The app caches ESPN responses briefly so live games can refresh frequently without hammering endpoints.
+ESPN scoreboard data is used first and does not require an API key. Saved scores appear at startup while fresh data loads before the playlist refresh. Independent score feeds load concurrently, and team matching is reused while scores and game status continue to update. ESPN feeds refresh once a minute, with spaced requests and automatic backoff for HTTP 429/503 responses that respects `Retry-After`. Cooldowns persist across restarts.
 
-API-Sports is optional fallback data for sports or matches ESPN does not cover. The app reads `API_SPORTS_KEY` from a local `.env` file beside `app.py`, or from the Settings screen.
+API-Sports is optional fallback data for sports or matches ESPN does not cover. It retains a 15-minute refresh interval and a daily request cap. The app reads `API_SPORTS_KEY` from a local `.env` file beside `app.py`, or from the Settings screen.
 
 ```env
 API_SPORTS_KEY=your_api_key_here

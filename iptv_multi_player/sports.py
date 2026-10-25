@@ -3,11 +3,16 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
+from functools import lru_cache
 import json
 import re
+import threading
+import time
 import unicodedata
+import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from typing import Any
 
 from .config import (
@@ -31,6 +36,58 @@ from .state import (
     write_sports_cache,
 )
 
+_request_lock = threading.Lock()
+_request_slots: dict[str, float] = {}
+_provider_backoff: dict[str, dict[str, int]] = {}
+
+
+def retry_after_seconds(value: str, now: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        try:
+            return max(0, int(parsedate_to_datetime(value).timestamp()) - now)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+
+def provider_ready(url: str, now: int) -> bool:
+    with _request_lock:
+        return now >= _provider_backoff.get(urlparse(url).netloc, {}).get("retry_at", 0)
+
+
+def fetch_sports_json(req: urllib.request.Request, spacing: float) -> dict[str, Any]:
+    host = urlparse(req.full_url).netloc
+    with _request_lock:
+        if now_ts() < _provider_backoff.get(host, {}).get("retry_at", 0):
+            raise RuntimeError("Score provider is cooling down after a rate-limit response.")
+        now = time.monotonic()
+        slot = max(now, _request_slots.get(host, 0))
+        _request_slots[host] = slot + spacing
+    if slot > now:
+        time.sleep(slot - now)
+    # A preceding request may have received a 429 while this worker waited.
+    if not provider_ready(req.full_url, now_ts()):
+        raise RuntimeError("Score provider is cooling down after a rate-limit response.")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in {429, 503}:
+            now = now_ts()
+            with _request_lock:
+                failures = _provider_backoff.get(host, {}).get("failures", 0) + 1
+                delay = max(min(3600, 300 * 2 ** min(failures - 1, 4)), retry_after_seconds((exc.headers or {}).get("Retry-After", ""), now))
+                retry_at = max(now + delay, _provider_backoff.get(host, {}).get("retry_at", 0))
+                _provider_backoff[host] = {"retry_at": retry_at, "failures": failures}
+        raise
+    with _request_lock:
+        if now_ts() >= _provider_backoff.get(host, {}).get("retry_at", 0):
+            _provider_backoff.pop(host, None)
+    return payload
+
+
+@lru_cache(maxsize=8192)
 def normalize_team_name(value: str) -> str:
     text = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode("ascii")
     text = text.lower().replace("&", " and ")
@@ -262,26 +319,33 @@ def normalize_espn_event(
 
 
 def fetch_espn_events(sport: str, endpoint_key: str, url: str, date_range: str) -> list[dict[str, Any]]:
-    req_url = f"{url}?{urlencode({'dates': date_range, 'limit': 500})}"
-    req = urllib.request.Request(
-        req_url,
-        headers={
-            "User-Agent": "IPTV-Multi-Player/1.0",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="replace"))
-
     events: list[dict[str, Any]] = []
-    for event in payload.get("events") or []:
-        if not isinstance(event, dict):
-            continue
-        for competition in event.get("competitions") or [{}]:
-            if not isinstance(competition, dict):
+    seen_ids: set[str] = set()
+    # Scoreboards reject date ranges; request today and tomorrow individually.
+    for query_date in dict.fromkeys(date_range.split("-")):
+        req_url = f"{url}?{urlencode({'dates': query_date, 'limit': 500})}"
+        req = urllib.request.Request(
+            req_url,
+            headers={
+                "User-Agent": "IPTV-Multi-Player/1.0",
+                "Accept": "application/json",
+            },
+        )
+        payload = fetch_sports_json(req, spacing=0.25)
+        for event in payload.get("events") or []:
+            if not isinstance(event, dict):
                 continue
-            normalized = normalize_espn_event(sport, event, competition, endpoint_key)
-            if normalized is not None:
+            for competition in event.get("competitions") or [{}]:
+                if not isinstance(competition, dict):
+                    continue
+                normalized = normalize_espn_event(sport, event, competition, endpoint_key)
+                if normalized is None:
+                    continue
+                identifier = str(normalized.get("id") or "")
+                if identifier and identifier in seen_ids:
+                    continue
+                if identifier:
+                    seen_ids.add(identifier)
                 events.append(normalized)
     return events
 
@@ -310,8 +374,7 @@ def fetch_sports_events(sport: str, date_value: str, key: str) -> list[dict[str,
             "x-apisports-key": key,
         },
     )
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    payload = fetch_sports_json(req, spacing=1.0)
 
     errors = payload.get("errors")
     if errors:
@@ -326,12 +389,16 @@ def fetch_sports_events(sport: str, date_value: str, key: str) -> list[dict[str,
     return events
 
 
-def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+def ensure_sports_cache_for(channels: list[dict[str, Any]], *, refresh: bool = True) -> tuple[dict[str, Any], dict[str, Any]]:
     requested_sports = requested_sports_for_channels(channels)
     requested_espn_sports = {sport for sport in requested_sports if sport in ESPN_CONFIG}
     cache = read_sports_cache()
     key = api_sports_key()
     now = now_ts()
+    with _request_lock:
+        for host, saved in cache.get("provider_backoff", {}).items():
+            if saved.get("retry_at", 0) > _provider_backoff.get(host, {}).get("retry_at", 0):
+                _provider_backoff[host] = dict(saved)
     query_dates = sports_query_dates()
     query_date_set = set(query_dates)
     espn_range = espn_query_range(query_dates)
@@ -347,9 +414,62 @@ def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, A
         "sports": {},
     }
 
+    # One bounded pool lets independent sports load together instead of in series.
+    fetches = []
+    for sport in sorted(requested_sports):
+        espn_sport_cache = cache.setdefault("espn", {}).setdefault(sport, {"endpoints": {}, "last_error": ""})
+        endpoint_caches = espn_sport_cache.setdefault("endpoints", {})
+        for endpoint_key, url in ESPN_CONFIG.get(sport, {}).get("endpoints", ()):
+            endpoint_cache = endpoint_caches.setdefault(endpoint_key, {
+                "date_range": "", "last_fetch": 0, "events": [], "last_error": "",
+            })
+            last_fetch = int(endpoint_cache.get("last_fetch", 0) or 0)
+            interval = ESPN_REFRESH_SECONDS
+            last_attempt = max(last_fetch, int(endpoint_cache.get("last_attempt", 0) or 0))
+            due = endpoint_cache.get("date_range") != espn_range or now - last_fetch >= interval
+            if refresh and due and now - last_attempt >= interval and provider_ready(url, now):
+                fetches.append((fetch_espn_events, (sport, endpoint_key, url, espn_range), endpoint_cache))
+
+        sport_cache = cache["sports"].setdefault(sport, {"calls": {}, "dates": {}, "last_error": ""})
+        calls_used = sports_calls_today(sport_cache)
+        for date_value in query_dates:
+            date_cache = sport_cache.setdefault("dates", {}).setdefault(date_value, {"last_fetch": 0, "events": []})
+            last_fetch = int(date_cache.get("last_fetch", 0) or 0)
+            last_attempt = max(last_fetch, int(date_cache.get("last_attempt", 0) or 0))
+            stale = now - last_fetch >= SPORTS_REFRESH_SECONDS
+            if refresh and key and stale and now - last_attempt >= SPORTS_REFRESH_SECONDS and provider_ready(SPORTS_CONFIG[sport]["base_url"], now):
+                if calls_used < SPORTS_DAILY_CALL_LIMIT:
+                    increment_sports_calls(sport_cache)
+                    calls_used += 1
+                    fetches.append((fetch_sports_events, (sport, date_value, key), date_cache))
+                else:
+                    sport_cache["last_error"] = "Daily API call limit reached for this sport."
+
+    if fetches:
+        with ThreadPoolExecutor(max_workers=min(8, len(fetches))) as executor:
+            futures = {
+                executor.submit(fetch, *args): (fetch, entry)
+                for fetch, args, entry in fetches
+            }
+            for future in as_completed(futures):
+                fetch, entry = futures[future]
+                entry["last_attempt"] = now
+                try:
+                    entry["events"] = future.result()
+                    entry["last_fetch"] = now
+                    entry["last_error"] = ""
+                    if fetch is fetch_espn_events:
+                        entry["date_range"] = espn_range
+                except Exception as exc:  # noqa: BLE001 - providers are nonfatal enrichment
+                    entry["last_error"] = str(exc)
+                changed = True
+        with _request_lock:
+            cache["provider_backoff"] = {host: dict(value) for host, value in _provider_backoff.items()}
+
     for sport in requested_sports:
         espn_event_count = 0
         espn_last_fetches: list[int] = []
+        espn_current = False
         espn_stale = False
         espn_error = ""
         espn_config = ESPN_CONFIG.get(sport)
@@ -357,39 +477,7 @@ def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, A
             espn_sport_cache = cache.setdefault("espn", {}).setdefault(sport, {"endpoints": {}, "last_error": ""})
             endpoint_caches = espn_sport_cache.setdefault("endpoints", {})
             expected_endpoint_keys = {endpoint_key for endpoint_key, _url in espn_config.get("endpoints", ())}
-            stale_endpoints: list[tuple[str, str, dict[str, Any]]] = []
-
-            for endpoint_key, url in espn_config.get("endpoints", ()):
-                endpoint_cache = endpoint_caches.setdefault(endpoint_key, {
-                    "date_range": "",
-                    "last_fetch": 0,
-                    "events": [],
-                    "last_error": "",
-                })
-                last_fetch = int(endpoint_cache.get("last_fetch", 0) or 0)
-                stale = endpoint_cache.get("date_range") != espn_range or now - last_fetch >= ESPN_REFRESH_SECONDS
-
-                if stale:
-                    stale_endpoints.append((endpoint_key, url, endpoint_cache))
-
-            if stale_endpoints:
-                max_workers = min(8, len(stale_endpoints))
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {
-                        executor.submit(fetch_espn_events, sport, endpoint_key, url, espn_range): (endpoint_key, endpoint_cache)
-                        for endpoint_key, url, endpoint_cache in stale_endpoints
-                    }
-                    for future in as_completed(futures):
-                        endpoint_key, endpoint_cache = futures[future]
-                        try:
-                            endpoint_cache["events"] = future.result()
-                            endpoint_cache["date_range"] = espn_range
-                            endpoint_cache["last_fetch"] = now
-                            endpoint_cache["last_error"] = ""
-                        except Exception as exc:  # noqa: BLE001 - ESPN is a nonfatal enrichment provider
-                            endpoint_cache["last_error"] = str(exc)
-                        changed = True
-
+            espn_intervals = []
             for endpoint_key in expected_endpoint_keys:
                 endpoint_cache = endpoint_caches.setdefault(endpoint_key, {
                     "date_range": "",
@@ -400,7 +488,10 @@ def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, A
                 espn_event_count += len(endpoint_cache.get("events", []))
                 endpoint_last_fetch = int(endpoint_cache.get("last_fetch", 0) or 0)
                 espn_last_fetches.append(endpoint_last_fetch)
-                espn_stale = espn_stale or now - endpoint_last_fetch >= ESPN_REFRESH_SECONDS
+                espn_current = espn_current or bool(endpoint_last_fetch and endpoint_cache.get("date_range") == espn_range)
+                interval = ESPN_REFRESH_SECONDS
+                espn_intervals.append(interval)
+                espn_stale = espn_stale or endpoint_cache.get("date_range") != espn_range or now - endpoint_last_fetch >= interval
                 if endpoint_cache.get("last_error"):
                     espn_error = str(endpoint_cache["last_error"])
 
@@ -413,27 +504,21 @@ def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, A
         sport_cache = cache["sports"].setdefault(sport, {"calls": {}, "dates": {}, "last_error": ""})
         calls_used = sports_calls_today(sport_cache)
 
-        for date_value in query_dates:
-            date_cache = sport_cache.setdefault("dates", {}).setdefault(date_value, {"last_fetch": 0, "events": []})
-            stale = now - int(date_cache.get("last_fetch", 0) or 0) >= SPORTS_REFRESH_SECONDS
-
-            if key and stale and calls_used < SPORTS_DAILY_CALL_LIMIT:
-                try:
-                    increment_sports_calls(sport_cache)
-                    calls_used += 1
-                    date_cache["events"] = fetch_sports_events(sport, date_value, key)
-                    date_cache["last_fetch"] = now
-                    sport_cache["last_error"] = ""
-                except Exception as exc:  # noqa: BLE001 - surfaced as cache status, not a fatal app error
-                    sport_cache["last_error"] = str(exc)
-                changed = True
-            elif key and stale and calls_used >= SPORTS_DAILY_CALL_LIMIT:
-                sport_cache["last_error"] = "Daily API call limit reached for this sport."
-
         for date_key in list(sport_cache.get("dates", {})):
             if date_key not in query_date_set:
                 del sport_cache["dates"][date_key]
                 changed = True
+
+        date_errors = [entry.get("last_error", "") for entry in sport_cache["dates"].values() if entry.get("last_error")]
+        if date_errors:
+            sport_cache["last_error"] = "; ".join(dict.fromkeys(date_errors))
+        elif key and calls_used >= SPORTS_DAILY_CALL_LIMIT and any(
+            now - int(entry.get("last_fetch", 0) or 0) >= SPORTS_REFRESH_SECONDS
+            for entry in sport_cache["dates"].values()
+        ):
+            sport_cache["last_error"] = "Daily API call limit reached for this sport."
+        else:
+            sport_cache["last_error"] = ""
 
         date_entries = [sport_cache.get("dates", {}).get(date_value, {}) for date_value in query_dates]
         last_fetches = [int(item.get("last_fetch", 0) or 0) for item in date_entries]
@@ -448,12 +533,13 @@ def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, A
             "last_fetch": min(all_fetches) if all_fetches else 0,
             "event_count": espn_event_count + api_event_count,
             "error": "; ".join(errors),
-            "stale": espn_stale or api_stale,
+            "stale": espn_stale or (bool(key) and api_stale),
+            "loading": not (espn_current or any(last_fetches)) and not errors and (bool(key) or bool(espn_config)),
             "providers": {
                 "espn": {
                     "configured": sport in ESPN_CONFIG,
                     "date_range": espn_range,
-                    "refresh_seconds": ESPN_REFRESH_SECONDS,
+                    "refresh_seconds": min(espn_intervals) if espn_config and espn_intervals else ESPN_REFRESH_SECONDS,
                     "last_fetch": min(espn_last_fetches) if espn_last_fetches else 0,
                     "event_count": espn_event_count,
                     "error": espn_error,
@@ -466,12 +552,21 @@ def ensure_sports_cache_for(channels: list[dict[str, Any]]) -> tuple[dict[str, A
                     "last_fetch": min(last_fetches) if last_fetches else 0,
                     "event_count": api_event_count,
                     "error": sport_cache.get("last_error", ""),
-                    "stale": api_stale,
+                    "stale": bool(key) and api_stale,
                 },
             },
         }
 
-    if changed:
+    meta["loading"] = any(item["loading"] for item in meta["sports"].values())
+    intervals = [
+        provider["refresh_seconds"]
+        for item in meta["sports"].values()
+        for provider in item["providers"].values()
+        if provider["configured"]
+    ]
+    meta["refresh_seconds"] = min(intervals) if intervals else SPORTS_REFRESH_SECONDS
+
+    if changed and refresh:
         write_sports_cache(cache)
 
     return cache, meta
@@ -705,74 +800,8 @@ def requested_sports_for_channels(channels: list[dict[str, Any]]) -> set[str]:
     }
 
 
-def sports_refresh_seconds(requested_sports: set[str]) -> int:
-    return ESPN_REFRESH_SECONDS if any(sport in ESPN_CONFIG for sport in requested_sports) else SPORTS_REFRESH_SECONDS
-
-
-def pending_sports_meta(channels: list[dict[str, Any]]) -> dict[str, Any]:
-    requested_sports = requested_sports_for_channels(channels)
-    requested_espn_sports = {sport for sport in requested_sports if sport in ESPN_CONFIG}
-    key = api_sports_key()
-    refresh_seconds = sports_refresh_seconds(requested_sports)
-    query_dates = sports_query_dates()
-    can_refresh = bool(key) or bool(requested_espn_sports)
-    return {
-        "configured": can_refresh,
-        "api_sports_configured": bool(key),
-        "espn_configured": True,
-        "refresh_seconds": refresh_seconds,
-        "espn_refresh_seconds": ESPN_REFRESH_SECONDS,
-        "api_sports_refresh_seconds": SPORTS_REFRESH_SECONDS,
-        "daily_call_limit": SPORTS_DAILY_CALL_LIMIT,
-        "loading": can_refresh,
-        "sports": {
-            sport: {
-                "calls_used": 0,
-                "dates": query_dates,
-                "last_fetch": 0,
-                "event_count": 0,
-                "error": "",
-                "stale": True,
-                "loading": bool(key) or sport in ESPN_CONFIG,
-                "providers": {
-                    "espn": {
-                        "configured": sport in ESPN_CONFIG,
-                        "refresh_seconds": ESPN_REFRESH_SECONDS,
-                        "last_fetch": 0,
-                        "event_count": 0,
-                        "error": "",
-                        "stale": True,
-                    },
-                    "api_sports": {
-                        "configured": bool(key),
-                        "refresh_seconds": SPORTS_REFRESH_SECONDS,
-                        "calls_used": 0,
-                        "last_fetch": 0,
-                        "event_count": 0,
-                        "error": "",
-                        "stale": True,
-                    },
-                },
-            }
-            for sport in sorted(requested_sports)
-        },
-    }
-
-
 def channels_with_pending_games(channels: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    pending_channels = []
-    key_configured = bool(api_sports_key())
-    for channel in channels:
-        next_channel = dict(channel)
-        sport = SPORT_BY_GROUP.get(channel.get("group", ""))
-        if not sport:
-            next_channel["game"] = stream_game_metadata()
-        elif key_configured or sport in ESPN_CONFIG:
-            next_channel["game"] = loading_game_metadata(channel)
-        else:
-            next_channel["game"] = unmatched_game_metadata(channel, "API key not configured")
-        pending_channels.append(next_channel)
-    return pending_channels, pending_sports_meta(channels)
+    return enrich_channels_with_games(channels, refresh=False)
 
 
 def status_code(event: dict[str, Any], sport: str) -> str:
@@ -849,33 +878,44 @@ def best_mma_event_match(matchup: dict[str, str], events: list[dict[str, Any]]) 
     return select_mma_card_event(best["events"]), best["score"]
 
 
+@lru_cache(maxsize=256)
+def best_team_event_index(home: str, away: str, candidates: tuple[tuple[str, str], ...]) -> tuple[int | None, float]:
+    # Cache only the association; scores and status always come from the current event.
+    best_index = None
+    best_score = 0.0
+    for index, (first, second) in enumerate(candidates):
+        direct = (team_match_score(home, first) + team_match_score(away, second)) / 2
+        swapped = (team_match_score(home, second) + team_match_score(away, first)) / 2
+        score = max(direct, swapped)
+        if score > best_score:
+            best_index = index
+            best_score = score
+            if best_score == 1.0:
+                break
+    if best_score < 0.82:
+        return None, best_score
+    return best_index, best_score
+
+
 def best_event_match(matchup: dict[str, str], events: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float]:
     if matchup.get("sport") == "mma":
         return best_mma_event_match(matchup, events)
     if SPORTS_CONFIG[matchup["sport"]].get("event_kind") == "race":
         return best_title_event_match(matchup, events)
 
-    best_event = None
-    best_score = 0.0
-    for event in events:
-        home, away = event_team_names(event)
-        direct = (team_match_score(matchup["home"], home) + team_match_score(matchup["away"], away)) / 2
-        swapped = (team_match_score(matchup["home"], away) + team_match_score(matchup["away"], home)) / 2
-        score = max(direct, swapped)
-        if score > best_score:
-            best_event = event
-            best_score = score
-    if best_score < 0.82:
-        return None, best_score
-    return best_event, best_score
+    candidates = tuple(event_team_names(event) for event in events)
+    index, confidence = best_team_event_index(matchup["home"], matchup["away"], candidates)
+    return (events[index] if index is not None else None), confidence
 
 
 def cached_espn_events(cache: dict[str, Any], sport: str) -> list[dict[str, Any]]:
     sport_cache = cache.get("espn", {}).get(sport, {})
     endpoints = sport_cache.get("endpoints", {})
+    date_range = espn_query_range(sports_query_dates())
     return [
         event
         for endpoint_cache in endpoints.values()
+        if endpoint_cache.get("date_range") == date_range
         for event in endpoint_cache.get("events", [])
         if isinstance(event, dict)
     ]
@@ -891,8 +931,8 @@ def cached_api_sports_events(cache: dict[str, Any], sport: str, query_dates: lis
     ]
 
 
-def enrich_channels_with_games(channels: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    cache, meta = ensure_sports_cache_for(channels)
+def enrich_channels_with_games(channels: list[dict[str, Any]], *, refresh: bool = True) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    cache, meta = ensure_sports_cache_for(channels, refresh=refresh)
     query_dates = sports_query_dates()
     enriched = []
     games_by_matchup: dict[tuple[str, str], dict[str, Any]] = {}
@@ -926,7 +966,11 @@ def enrich_channels_with_games(channels: list[dict[str, Any]]) -> tuple[list[dic
             reason = "No matching game found"
             if sport not in ESPN_CONFIG and not meta.get("api_sports_configured"):
                 reason = "API key not configured"
-            next_channel["game"] = unmatched_game_metadata(channel, reason)
+            next_channel["game"] = (
+                loading_game_metadata(channel)
+                if not refresh and meta.get("sports", {}).get(sport, {}).get("loading")
+                else unmatched_game_metadata(channel, reason)
+            )
         else:
             next_channel["game"] = game_metadata(event, sport, confidence)
         games_by_matchup[matchup_key] = next_channel["game"]
